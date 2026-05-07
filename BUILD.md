@@ -90,7 +90,7 @@ xwin --accept-license splat --output ~/.xwin
 If you prefer to compile manually from a Developer Command Prompt:
 
 ```batch
-cl.exe src\oled_aegis.c /Fe:oled_aegis.exe /O2 /MD /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib
+cl.exe src\oled_aegis.c /Fe:oled_aegis.exe /O2 /MD /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib dwmapi.lib
 ```
 
 ## Build Options
@@ -122,6 +122,8 @@ The PowerShell build script includes:
 * **advapi32.lib** - Advanced Windows APIs (for registry functions)
 * **comctl32.lib** - Common Controls library (for NumericUpDown control)
 * **powrprof.lib** - Power Profile library (for media detection)
+* **psapi.lib** - Process Status API library (for mapping windows to media-capable apps)
+* **dwmapi.lib** - Desktop Window Manager API library (for ignoring hidden/cloaked windows during media detection)
 
 ## Troubleshooting
 

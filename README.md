@@ -31,7 +31,7 @@ For convenient access, you can place it in any folder and create a shortcut, or 
 
 * **Per-Monitor Control**: Enable screen saver on specific monitors only
 * **Per-Monitor Input Detection**: Optionally track input separately for each monitor, allowing unused monitors to activate screen saver while you continue using others
-* **Media Awareness**: Doesn't activate the screen saver if a video is playing
+* **Per-Monitor Media Awareness**: Doesn't activate the screen saver on a monitor where media is playing
 * **Reliable Activation**: Consistently activates after system sleep/wake cycles
 * **Minimal Resource Usage**: Written in pure C with no external dependencies
 * **Simple Configuration**: Edit a plain text INI file or use the system tray menu
@@ -49,7 +49,7 @@ Configuration is stored in `%APPDATA%\OLED_Aegis\oled_aegis.ini`. This file is c
 * **idleTimeout**: Seconds of inactivity before screen saver activates (default: 300 seconds = 5 minutes)
 * **checkInterval**: Milliseconds between idle time checks (default: 1000ms, min: 250ms, max: 10000ms)
 * **pixelShiftCompensation**: Pixels to expand the screen saver window beyond the monitor's reported bounds on each side (default: 0, disabled). Set to `4`–`8` if your QD-OLED panel's hardware pixel shift feature causes a thin strip of the desktop to appear at the screen edge during screen saver activation.
-* **mediaDetectionEnabled**: Set to `1` to prevent screen saver during media playback, `0` to disable (default: 1)
+* **mediaDetectionEnabled**: Set to `1` to prevent screen saver on monitors with visible media playback, `0` to disable (default: 1)
 * **startupEnabled**: Set to `1` to run at Windows startup, `0` to disable (default: 0)
 * **debugMode**: Set to `1` to enable debug logging to `%APPDATA%\OLED_Aegis\oled_aegis_debug.log`, `0` to disable (default: 0). **Note:** only for troubleshooting issues.
 * **perMonitorInputDetection**: Set to `1` to track input separately for each monitor (default: 0). When enabled, each monitor has its own idle timer based on mouse cursor position and focused window location. This allows the screen saver to activate on unused monitors while you continue working on others.
@@ -69,13 +69,13 @@ Configuration is stored in `%APPDATA%\OLED_Aegis\oled_aegis.ini`. This file is c
 ### Behavior
 
 #### Global Mode (default)
-The screen saver will automatically activate on all enabled monitors when:
+The screen saver will automatically activate on enabled monitors without visible media playback when:
 1. No user input (keyboard/mouse) for `idleTimeout` seconds
-2. No media is playing (if `mediaDetectionEnabled=1`)
+2. No media is playing on that monitor (if `mediaDetectionEnabled=1`)
 
-The screen saver will automatically deactivate from all monitors when:
+The screen saver will automatically deactivate from monitors when:
 1. Any user input is detected
-2. Media starts playing (if `mediaDetectionEnabled=1`)
+2. Media starts playing on that monitor (if `mediaDetectionEnabled=1`)
 
 #### Per-Monitor Mode (`perMonitorInputDetection=1`)
 Each enabled monitor has its own independent idle timer. Input is attributed to monitors based on:
@@ -108,7 +108,7 @@ build.bat
 
 ### Manual Build
 ```batch
-cl.exe src\oled_aegis.c /Fe:oled_aegis.exe /O2 /MD /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib
+cl.exe src\oled_aegis.c /Fe:oled_aegis.exe /O2 /MD /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib dwmapi.lib
 ```
 
 See [BUILD.md](BUILD.md) for more information.

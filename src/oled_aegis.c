@@ -4,12 +4,16 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
 #include <commctrl.h>
 #include <powerbase.h>
 #include <psapi.h>
+#include <dwmapi.h>
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 #define APP_NAME L"OLED Aegis"
 #define WM_TRAYICON (WM_USER + 1)
@@ -47,6 +51,11 @@
 #define IDLE_DEACTIVATE_THRESHOLD_SEC 2     // Time threshold in seconds (for per-monitor mode)
 #define SHELL_CLOSE_DELAY_MS        250     // Delay after sending Escape to close shell windows
 #define SHELL_CLOSE_MAX_ATTEMPTS    2       // Maximum attempts to close shell windows
+#define MIN_MEDIA_WINDOW_AREA       10000   // Ignore tiny windows when mapping media to monitors
+#define MIN_MEDIA_WINDOW_OVERLAP_RATIO 0.10 // Ignore thin window-border overlap onto adjacent monitors
+#define MEDIA_DETECTION_CACHE_MS    2000    // Cache media-window scans to keep timer work light
+#define TOPMOST_REFRESH_INTERVAL_MS 5000    // Reassert topmost occasionally, not every timer tick
+#define CURSOR_COUNTER_MAX_ATTEMPTS 16      // Safety bound when normalizing ShowCursor's counter
 
 // Check interval bounds (milliseconds)
 #define MIN_CHECK_INTERVAL_MS   250
@@ -77,10 +86,13 @@ void HideScreenSaver();
 void HideScreenSaverOnMonitor(int monitorIndex);
 int IsAnyMonitorActive();
 void UpdateTrayIcon(int active);
+void LogMessage(const char* format, ...);
 int FindMonitorByDeviceName(const char* deviceName);
 int FindMonitorByDevicePath(const char* devicePath);
 int FindPrimaryMonitorIndex();
 int IsAnyMonitorEnabled();
+int GetProcessNameFromHwnd(HWND hWnd, char* buffer, int bufferSize);
+int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]);
 
 typedef struct {
     HMONITOR hMonitor;
@@ -103,6 +115,13 @@ typedef struct {
 } MonitorState;
 
 typedef struct {
+    int strongMediaOnMonitor[MAX_MONITOR_COUNT];
+    int weakMediaOnMonitor[MAX_MONITOR_COUNT];
+    int strongWindowCount;
+    int weakWindowCount;
+} MediaWindowEnumContext;
+
+typedef struct {
     int idleTimeout;
     int checkInterval;
     int mediaDetectionEnabled;
@@ -121,6 +140,8 @@ typedef struct {
     int screenSaverActive;
     int isShuttingDown;
     int cursorHidden;
+    int trayMenuActive;
+    int trayIconActive;
     DWORD manualActivationTime;
     int isManualActivation;
 } AppState;
@@ -139,6 +160,72 @@ static int g_monitorCount = 0;
 static int g_currentMonitorIndex = 0;
 static MonitorInfo g_monitors[MAX_MONITOR_COUNT];
 static MonitorState g_monitorStates[MAX_MONITOR_COUNT];
+
+int ClampInt(int value, int minValue, int maxValue) {
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+void ClampConfigValues() {
+    g_app.config.idleTimeout = ClampInt(g_app.config.idleTimeout, MIN_IDLE_TIMEOUT_SEC, MAX_IDLE_TIMEOUT_SEC);
+    g_app.config.checkInterval = ClampInt(g_app.config.checkInterval, MIN_CHECK_INTERVAL_MS, MAX_CHECK_INTERVAL_MS);
+    g_app.config.pixelShiftCompensation = ClampInt(
+        g_app.config.pixelShiftCompensation,
+        MIN_PIXEL_SHIFT_COMPENSATION,
+        MAX_PIXEL_SHIFT_COMPENSATION
+    );
+
+    g_app.config.mediaDetectionEnabled = g_app.config.mediaDetectionEnabled ? 1 : 0;
+    g_app.config.startupEnabled = g_app.config.startupEnabled ? 1 : 0;
+    g_app.config.debugMode = g_app.config.debugMode ? 1 : 0;
+    g_app.config.perMonitorInputDetection = g_app.config.perMonitorInputDetection ? 1 : 0;
+}
+
+int IsAppUiActive() {
+    return g_app.trayMenuActive || g_hSettingsDialog != NULL;
+}
+
+void EnsureCursorVisible(const char* reason) {
+    int adjusted = 0;
+    int count = 0;
+
+    if (g_app.cursorHidden) {
+        do {
+            count = ShowCursor(TRUE);
+            adjusted++;
+        } while (count < 0 && adjusted < CURSOR_COUNTER_MAX_ATTEMPTS);
+
+        g_app.cursorHidden = 0;
+    } else {
+        CURSORINFO cursorInfo = {0};
+        cursorInfo.cbSize = sizeof(cursorInfo);
+        if (GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) == 0) {
+            do {
+                count = ShowCursor(TRUE);
+                adjusted++;
+            } while (count < 0 && adjusted < CURSOR_COUNTER_MAX_ATTEMPTS);
+        }
+    }
+
+    if (adjusted) {
+        LogMessage("Cursor restored (%s, count=%d, adjustments=%d)",
+                   reason ? reason : "unknown", count, adjusted);
+    }
+}
+
+void HideCursorForScreenSaver(const char* reason) {
+    if (IsAppUiActive()) {
+        EnsureCursorVisible(reason ? reason : "app UI active");
+        return;
+    }
+
+    if (!g_app.cursorHidden) {
+        int count = ShowCursor(FALSE);
+        g_app.cursorHidden = 1;
+        LogMessage("Cursor hidden (%s, count=%d)", reason ? reason : "screen saver", count);
+    }
+}
 
 int ScaleDPI(int value) {
     return MulDiv(value, g_settingsDpi, 96);
@@ -494,6 +581,9 @@ void LoadConfig() {
     sprintf_s(configPath, sizeof(configPath), "%s\\oled_aegis.ini", appDataPath);
 
     g_app.config.monitorCount = g_monitorCount;
+    for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
+        g_app.config.monitorsEnabled[i] = (i < g_monitorCount) ? 1 : 0;
+    }
 
     int hadMonitorConfig = 0;  // Track if we found any monitor config entries
     int anyMonitorMatched = 0; // Track if any monitor config matched current monitors
@@ -570,6 +660,10 @@ void LoadConfig() {
     // Fallback: if we had monitor config but none matched, enable the primary monitor
     // This handles the case where display configuration changed (monitors unplugged/replugged)
     if (hadMonitorConfig && !anyMonitorMatched) {
+        for (int i = 0; i < g_monitorCount; i++) {
+            g_app.config.monitorsEnabled[i] = 0;
+        }
+
         int primaryIdx = FindPrimaryMonitorIndex();
         if (primaryIdx >= 0) {
             g_app.config.monitorsEnabled[primaryIdx] = 1;
@@ -577,6 +671,8 @@ void LoadConfig() {
                       primaryIdx, g_monitors[primaryIdx].friendlyName);
         }
     }
+
+    ClampConfigValues();
 }
 
 void SaveConfig() {
@@ -762,6 +858,355 @@ int GetProcessNameFromHwnd(HWND hWnd, char* buffer, int bufferSize) {
     return result > 0 ? 1 : 0;
 }
 
+int ContainsIgnoreCase(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return 0;
+
+    size_t needleLen = strlen(needle);
+    if (needleLen == 0) return 1;
+
+    for (const char* p = haystack; *p; p++) {
+        if (_strnicmp(p, needle, needleLen) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int ProcessNameMatchesAny(const char* processName, const char* const* names, int count) {
+    if (!processName) return 0;
+
+    for (int i = 0; i < count; i++) {
+        if (_stricmp(processName, names[i]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int IsKnownBrowserProcess(const char* processName) {
+    static const char* const browserProcesses[] = {
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "opera_gx.exe",
+        "vivaldi.exe",
+        "arc.exe",
+        "thorium.exe",
+        "zen.exe"
+    };
+
+    return ProcessNameMatchesAny(
+        processName,
+        browserProcesses,
+        (int)(sizeof(browserProcesses) / sizeof(browserProcesses[0]))
+    );
+}
+
+int IsKnownMediaProcess(const char* processName) {
+    static const char* const mediaProcesses[] = {
+        "vlc.exe",
+        "mpv.exe",
+        "mpvnet.exe",
+        "potplayer.exe",
+        "potplayermini.exe",
+        "potplayermini64.exe",
+        "wmplayer.exe",
+        "mpc-hc.exe",
+        "mpc-hc64.exe",
+        "mpc-be.exe",
+        "mpc-be64.exe",
+        "kodi.exe",
+        "plex.exe",
+        "plexamp.exe",
+        "jellyfinmediaplayer.exe",
+        "embytheater.exe",
+        "video.ui.exe",
+        "spotify.exe",
+        "music.ui.exe",
+        "itunes.exe",
+        "applemusic.exe"
+    };
+
+    return ProcessNameMatchesAny(
+        processName,
+        mediaProcesses,
+        (int)(sizeof(mediaProcesses) / sizeof(mediaProcesses[0]))
+    );
+}
+
+int WindowTitleHasMediaHint(const char* title) {
+    static const char* const mediaTitleHints[] = {
+        "YouTube",
+        "YouTube Music",
+        "Twitch",
+        "Netflix",
+        "Hulu",
+        "Disney+",
+        "Prime Video",
+        "Amazon Prime",
+        "HBO Max",
+        "Paramount+",
+        "Peacock",
+        "Crunchyroll",
+        "Vimeo",
+        "Dailymotion",
+        "Plex",
+        "Jellyfin",
+        "Emby",
+        "Spotify",
+        "SoundCloud",
+        "Bandcamp",
+        "Apple Music",
+        "Media Player",
+        "VLC media player",
+        "Picture in picture"
+    };
+
+    if (!title || title[0] == '\0') return 0;
+
+    for (int i = 0; i < (int)(sizeof(mediaTitleHints) / sizeof(mediaTitleHints[0])); i++) {
+        if (ContainsIgnoreCase(title, mediaTitleHints[i])) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int GetMediaWindowCandidateStrength(const char* processName, const char* title) {
+    if (IsKnownMediaProcess(processName)) {
+        return 2;
+    }
+
+    if (IsKnownBrowserProcess(processName)) {
+        return WindowTitleHasMediaHint(title) ? 2 : 1;
+    }
+
+    if (WindowTitleHasMediaHint(title)) {
+        return 2;
+    }
+
+    return 0;
+}
+
+int IsWindowCloakedCompat(HWND hWnd) {
+    DWORD cloaked = 0;
+    HRESULT hr = DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    return SUCCEEDED(hr) && cloaked != 0;
+}
+
+LONGLONG RectArea(const RECT* rect) {
+    LONG width = rect->right - rect->left;
+    LONG height = rect->bottom - rect->top;
+
+    if (width <= 0 || height <= 0) {
+        return 0;
+    }
+
+    return (LONGLONG)width * (LONGLONG)height;
+}
+
+LONGLONG RectIntersectionArea(const RECT* a, const RECT* b) {
+    LONG left = a->left > b->left ? a->left : b->left;
+    LONG top = a->top > b->top ? a->top : b->top;
+    LONG right = a->right < b->right ? a->right : b->right;
+    LONG bottom = a->bottom < b->bottom ? a->bottom : b->bottom;
+
+    if (right <= left || bottom <= top) {
+        return 0;
+    }
+
+    return (LONGLONG)(right - left) * (LONGLONG)(bottom - top);
+}
+
+int GetVisibleWindowRect(HWND hWnd, RECT* rect) {
+    RECT frameRect;
+    HRESULT hr = DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect));
+    if (SUCCEEDED(hr) && RectArea(&frameRect) > 0) {
+        *rect = frameRect;
+        return 1;
+    }
+
+    return GetWindowRect(hWnd, rect) != 0;
+}
+
+void MarkMediaWindowMonitors(MediaWindowEnumContext* ctx, const RECT* windowRect, int strength) {
+    int marked = 0;
+    LONGLONG windowArea = RectArea(windowRect);
+
+    if (windowArea < MIN_MEDIA_WINDOW_AREA) {
+        return;
+    }
+
+    for (int i = 0; i < g_monitorCount; i++) {
+        LONGLONG intersectionArea = RectIntersectionArea(windowRect, &g_monitors[i].rect);
+        double overlapRatio = (double)intersectionArea / (double)windowArea;
+        if (intersectionArea >= MIN_MEDIA_WINDOW_AREA && overlapRatio >= MIN_MEDIA_WINDOW_OVERLAP_RATIO) {
+            if (strength >= 2) {
+                ctx->strongMediaOnMonitor[i] = 1;
+            } else {
+                ctx->weakMediaOnMonitor[i] = 1;
+            }
+            marked = 1;
+        }
+    }
+
+    if (!marked) {
+        int monitorIndex = GetMonitorIndexFromRect(*windowRect);
+        if (monitorIndex >= 0 && monitorIndex < g_monitorCount) {
+            if (strength >= 2) {
+                ctx->strongMediaOnMonitor[monitorIndex] = 1;
+            } else {
+                ctx->weakMediaOnMonitor[monitorIndex] = 1;
+            }
+        }
+    }
+}
+
+BOOL CALLBACK EnumMediaWindowCallback(HWND hWnd, LPARAM lParam) {
+    MediaWindowEnumContext* ctx = (MediaWindowEnumContext*)lParam;
+
+    if (!IsWindowVisible(hWnd) || IsIconic(hWnd) || IsWindowCloakedCompat(hWnd)) {
+        return TRUE;
+    }
+
+    LONG_PTR exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+    if ((exStyle & WS_EX_TOOLWINDOW) != 0) {
+        return TRUE;
+    }
+
+    RECT rect;
+    if (!GetVisibleWindowRect(hWnd, &rect)) {
+        return TRUE;
+    }
+
+    if (RectArea(&rect) <= 0) {
+        return TRUE;
+    }
+
+    char processName[MAX_PATH] = {0};
+    if (!GetProcessNameFromHwnd(hWnd, processName, sizeof(processName))) {
+        return TRUE;
+    }
+
+    char title[512] = {0};
+    GetWindowTextA(hWnd, title, sizeof(title));
+
+    int strength = GetMediaWindowCandidateStrength(processName, title);
+    if (strength == 0) {
+        return TRUE;
+    }
+
+    if (strength >= 2) {
+        ctx->strongWindowCount++;
+    } else {
+        ctx->weakWindowCount++;
+    }
+
+    MarkMediaWindowMonitors(ctx, &rect, strength);
+    return TRUE;
+}
+
+int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
+    static DWORD lastLoggedMask = (DWORD)-1;
+    static DWORD lastScanTick = 0;
+    static int hasCachedState = 0;
+    static int cachedAnyMedia = 0;
+    static int cachedMediaOnMonitor[MAX_MONITOR_COUNT] = {0};
+
+    for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
+        mediaOnMonitor[i] = 0;
+    }
+
+    if (!g_app.config.mediaDetectionEnabled) {
+        hasCachedState = 0;
+        if (lastLoggedMask != 0) {
+            LogMessage("Media monitor detection: disabled");
+            lastLoggedMask = 0;
+        }
+        return 0;
+    }
+
+    DWORD nowTick = GetTickCount();
+    if (hasCachedState && (DWORD)(nowTick - lastScanTick) < MEDIA_DETECTION_CACHE_MS) {
+        for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
+            mediaOnMonitor[i] = cachedMediaOnMonitor[i];
+        }
+        return cachedAnyMedia;
+    }
+
+    lastScanTick = nowTick;
+
+    int globalMediaPlaying = IsMediaPlaying();
+
+    if (!globalMediaPlaying) {
+        for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
+            cachedMediaOnMonitor[i] = 0;
+        }
+        hasCachedState = 1;
+        cachedAnyMedia = 0;
+
+        if (lastLoggedMask != 0) {
+            LogMessage("Media monitor detection: no active media monitors");
+            lastLoggedMask = 0;
+        }
+        return 0;
+    }
+
+    MediaWindowEnumContext ctx = {0};
+    EnumWindows(EnumMediaWindowCallback, (LPARAM)&ctx);
+
+    int usedGlobalFallback = 0;
+    int mappedMonitorCount = 0;
+    if (ctx.strongWindowCount > 0) {
+        for (int i = 0; i < g_monitorCount; i++) {
+            mediaOnMonitor[i] = ctx.strongMediaOnMonitor[i];
+            if (mediaOnMonitor[i]) mappedMonitorCount++;
+        }
+    }
+
+    if (mappedMonitorCount == 0 && ctx.weakWindowCount > 0) {
+        for (int i = 0; i < g_monitorCount; i++) {
+            mediaOnMonitor[i] = ctx.weakMediaOnMonitor[i];
+            if (mediaOnMonitor[i]) mappedMonitorCount++;
+        }
+    }
+
+    if (mappedMonitorCount == 0) {
+        // If Windows reports media playback but we cannot map it to a visible window, keep
+        // the previous conservative behavior so playback is not accidentally covered.
+        for (int i = 0; i < g_monitorCount; i++) {
+            mediaOnMonitor[i] = g_monitorStates[i].enabled ? 1 : 0;
+        }
+        usedGlobalFallback = 1;
+    }
+
+    DWORD mask = 0;
+    for (int i = 0; i < g_monitorCount && i < 32; i++) {
+        if (mediaOnMonitor[i]) {
+            mask |= (1u << i);
+        }
+    }
+
+    hasCachedState = 1;
+    cachedAnyMedia = mask != 0;
+    for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
+        cachedMediaOnMonitor[i] = mediaOnMonitor[i];
+    }
+
+    if (mask != lastLoggedMask) {
+        LogMessage("Media monitor detection: mask=0x%08X (strongWindows=%d, weakWindows=%d, fallback=%d)",
+                   mask, ctx.strongWindowCount, ctx.weakWindowCount, usedGlobalFallback);
+        lastLoggedMask = mask;
+    }
+
+    return cachedAnyMedia;
+}
+
 // Check if a Windows shell overlay window (Start Menu, Task View, Action Center) is open
 // Returns the number of shell windows detected (0, 1, or 2 if both Start Menu and Action Center)
 int IsShellWindowOpen() {
@@ -934,11 +1379,7 @@ void ShowScreenSaverOnMonitor(int monitorIndex, int isManual) {
     }
 
     if (!g_app.config.perMonitorInputDetection) {
-        if (!g_app.cursorHidden) {
-            ShowCursor(FALSE);
-            g_app.cursorHidden = 1;
-            LogMessage("Cursor hidden");
-        }
+        HideCursorForScreenSaver("screen saver activation");
     }
 }
 
@@ -1015,11 +1456,7 @@ void HideScreenSaver() {
     g_app.manualActivationTime = 0;
     g_app.isManualActivation = 0;
 
-    if (g_app.cursorHidden) {
-        ShowCursor(TRUE);
-        g_app.cursorHidden = 0;
-        LogMessage("Cursor restored");
-    }
+    EnsureCursorVisible("screen saver hidden");
 }
 
 void EnsureScreenSaverTopmost() {
@@ -1070,6 +1507,11 @@ LRESULT CALLBACK SettingsDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             g_hSettingsDialog = NULL;
             return 0;
         case WM_DESTROY:
+            if (g_hTooltipControl) {
+                DestroyWindow(g_hTooltipControl);
+                g_hTooltipControl = NULL;
+            }
+
             if (g_hSettingsFont) {
                 DeleteObject(g_hSettingsFont);
                 g_hSettingsFont = NULL;
@@ -1080,6 +1522,8 @@ LRESULT CALLBACK SettingsDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 }
 
 void AddTooltip(HWND hParent, HWND hControl, const char* text) {
+    if (!g_hTooltipControl || !hControl || !text) return;
+
     TOOLINFOA ti = {0};
     ti.cbSize = sizeof(TOOLINFOA);
     ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
@@ -1092,6 +1536,8 @@ void AddTooltip(HWND hParent, HWND hControl, const char* text) {
 }
 
 void ShowSettingsDialog() {
+    EnsureCursorVisible("settings dialog opened");
+
     if (g_hSettingsDialog) {
         SetForegroundWindow(g_hSettingsDialog);
         return;
@@ -1111,13 +1557,6 @@ void ShowSettingsDialog() {
     ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, g_settingsDpi, 96);
     g_hSettingsFont = CreateFontIndirectA(&ncm.lfMessageFont);
 
-    HWND hTooltip = CreateWindowExA(0, TOOLTIPS_CLASSA, NULL,
-                               WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                               CW_USEDEFAULT, CW_USEDEFAULT,
-                               CW_USEDEFAULT, CW_USEDEFAULT,
-                               g_hSettingsDialog, NULL, GetModuleHandle(NULL), NULL);
-    g_hTooltipControl = hTooltip;
-
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = DefWindowProc;
     wc.hInstance = GetModuleHandle(NULL);
@@ -1136,6 +1575,12 @@ void ShowSettingsDialog() {
 
     if (g_hSettingsDialog) {
         SetWindowLongPtr(g_hSettingsDialog, GWLP_WNDPROC, (LONG_PTR)SettingsDialogProc);
+
+        g_hTooltipControl = CreateWindowExA(0, TOOLTIPS_CLASSA, NULL,
+                                           WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                           CW_USEDEFAULT, CW_USEDEFAULT,
+                                           CW_USEDEFAULT, CW_USEDEFAULT,
+                                           g_hSettingsDialog, NULL, GetModuleHandle(NULL), NULL);
 
         // Update DPI now that we have a window
         g_settingsDpi = GetDpiForWindowCompat(g_hSettingsDialog);
@@ -1289,7 +1734,7 @@ void ShowSettingsDialog() {
         AddTooltip(g_hSettingsDialog, hIntervalEdit,
                    "How often to poll for user activity. (250-10000ms).");
         AddTooltip(g_hSettingsDialog, hVideoCheck,
-                   "Prevent screen saver activation during video playback.");
+                   "Prevent screen saver activation on monitors with visible media playback.");
         AddTooltip(g_hSettingsDialog, hDebugCheck,
                    "Enable debug logging to %APPDATA%\\OLED_Aegis\\oled_aegis_debug.log");
         AddTooltip(g_hSettingsDialog, hStartupCheck,
@@ -1333,10 +1778,7 @@ void ApplySettings(HWND hWnd) {
 
     GetDlgItemTextA(hWnd, IDC_INTERVAL_EDIT, buffer, 32);
     int oldInterval = g_app.config.checkInterval;
-    int newInterval = atoi(buffer);
-    if (newInterval < MIN_CHECK_INTERVAL_MS) newInterval = MIN_CHECK_INTERVAL_MS;
-    if (newInterval > MAX_CHECK_INTERVAL_MS) newInterval = MAX_CHECK_INTERVAL_MS;
-    g_app.config.checkInterval = newInterval;
+    g_app.config.checkInterval = atoi(buffer);
 
     int oldMedia = g_app.config.mediaDetectionEnabled;
     int oldDebug = g_app.config.debugMode;
@@ -1349,10 +1791,8 @@ void ApplySettings(HWND hWnd) {
     g_app.config.perMonitorInputDetection = IsDlgButtonChecked(hWnd, IDC_PERMONITOR_CHECK) == BST_CHECKED;
 
     GetDlgItemTextA(hWnd, IDC_PIXELSHIFT_EDIT, buffer, 32);
-    int newPixelShift = atoi(buffer);
-    if (newPixelShift < MIN_PIXEL_SHIFT_COMPENSATION) newPixelShift = MIN_PIXEL_SHIFT_COMPENSATION;
-    if (newPixelShift > MAX_PIXEL_SHIFT_COMPENSATION) newPixelShift = MAX_PIXEL_SHIFT_COMPENSATION;
-    g_app.config.pixelShiftCompensation = newPixelShift;
+    g_app.config.pixelShiftCompensation = atoi(buffer);
+    ClampConfigValues();
 
     for (int i = 0; i < g_monitorCount; i++) {
         int wasEnabled = g_app.config.monitorsEnabled[i];
@@ -1373,11 +1813,7 @@ void ApplySettings(HWND hWnd) {
 
     if (!IsAnyMonitorActive()) {
         g_app.screenSaverActive = 0;
-        if (g_app.cursorHidden) {
-            ShowCursor(TRUE);
-            g_app.cursorHidden = 0;
-            LogMessage("Cursor restored (no active monitors)");
-        }
+        EnsureCursorVisible("no active monitors after settings");
     }
 
     if (!oldPerMonitor && g_app.config.perMonitorInputDetection) {
@@ -1408,12 +1844,24 @@ void ApplySettings(HWND hWnd) {
 
     sprintf_s(buffer, 32, "%d", g_app.config.checkInterval);
     SetDlgItemTextA(hWnd, IDC_INTERVAL_EDIT, buffer);
+
+    sprintf_s(buffer, 32, "%d", g_app.config.idleTimeout);
+    SetDlgItemTextA(hWnd, IDC_TIMEOUT_EDIT, buffer);
+
+    sprintf_s(buffer, 32, "%d", g_app.config.pixelShiftCompensation);
+    SetDlgItemTextA(hWnd, IDC_PIXELSHIFT_EDIT, buffer);
 }
 
 void UpdateTrayIcon(int active) {
+    active = active ? 1 : 0;
+    if (g_app.trayIconActive == active) {
+        return;
+    }
+
     g_app.nid.hIcon = active ? g_hIconActive : g_hIconInactive;
     lstrcpyA(g_app.nid.szTip, active ? "OLED Aegis - Active" : "OLED Aegis - Idle");
     Shell_NotifyIconA(NIM_MODIFY, (PNOTIFYICONDATAA)&g_app.nid);
+    g_app.trayIconActive = active;
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1422,6 +1870,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             memset(&g_app, 0, sizeof(g_app));
             g_app.hWnd = hWnd;
             g_app.isShuttingDown = 0;
+            g_app.trayIconActive = -1;
 
             g_hInstanceMutex = CreateMutexW(NULL, TRUE, L"OLEDAegis_SingleInstance");
             if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1445,6 +1894,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_app.nid.hIcon = g_hIconInactive;
             lstrcpyA(g_app.nid.szTip, "OLED Aegis - Idle");
             Shell_NotifyIconA(NIM_ADD, &g_app.nid);
+            g_app.trayIconActive = 0;
 
             g_app.config.idleTimeout = DEFAULT_IDLE_TIMEOUT;
             g_app.config.checkInterval = 1000;
@@ -1502,7 +1952,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 if (g_app.config.perMonitorInputDetection) {
                     DWORD idleTime = GetIdleTime();
                     time_t now = time(NULL);
-                    int mediaPlaying = IsMediaPlaying();
+                    int mediaOnMonitor[MAX_MONITOR_COUNT] = {0};
+                    UpdateMediaMonitorStates(mediaOnMonitor);
 
                     int inManualCooldown = 0;
                     if (g_app.isManualActivation) {
@@ -1549,23 +2000,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         if (!g_monitorStates[i].enabled) continue;
 
                         int idleSeconds = (int)(now - g_monitorStates[i].lastInputTime);
+                        int monitorHasMedia = mediaOnMonitor[i];
 
-                        if (!mediaPlaying && idleSeconds >= g_app.config.idleTimeout) {
+                        if (!monitorHasMedia && idleSeconds >= g_app.config.idleTimeout) {
                             if (!g_monitorStates[i].screenSaverActive) {
                                 LogMessage("Timer: Activating screen saver on monitor %d (idle: %ds)", i, idleSeconds);
                                 ShowScreenSaverOnMonitor(i, 0);
                             }
                         } else if (g_monitorStates[i].screenSaverActive && !inManualCooldown) {
-                            if (idleSeconds < IDLE_DEACTIVATE_THRESHOLD_SEC) {
+                            if (monitorHasMedia) {
+                                LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
+                                HideScreenSaverOnMonitor(i);
+                            } else if (idleSeconds < IDLE_DEACTIVATE_THRESHOLD_SEC) {
                                 LogMessage("Timer: Deactivating screen saver on monitor %d (input detected)", i);
                                 HideScreenSaverOnMonitor(i);
                             }
                         }
                     }
 
-                    if (!IsAnyMonitorActive()) {
-                        g_app.screenSaverActive = 0;
-                    }
+                    g_app.screenSaverActive = IsAnyMonitorActive() ? 1 : 0;
 
                     POINT cursorPt;
                     GetCursorPos(&cursorPt);
@@ -1573,30 +2026,48 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     int cursorOnActiveMonitor = (cursorMonitorIndex >= 0 && cursorMonitorIndex < g_monitorCount && g_monitorStates[cursorMonitorIndex].screenSaverActive);
 
                     if (cursorOnActiveMonitor) {
-                        if (!g_app.cursorHidden) {
-                            ShowCursor(FALSE);
-                            g_app.cursorHidden = 1;
-                            LogMessage("Cursor hidden");
-                        }
+                        HideCursorForScreenSaver("cursor on active monitor");
                     } else {
                         if (g_app.cursorHidden) {
-                            ShowCursor(TRUE);
-                            g_app.cursorHidden = 0;
-                            LogMessage("Cursor restored");
+                            EnsureCursorVisible("cursor left active monitor");
                         }
                     }
 
-                    UpdateTrayIcon(IsAnyMonitorActive() ? 1 : 0);
+                    UpdateTrayIcon(g_app.screenSaverActive);
                 } else {
                     DWORD idleTime = GetIdleTime();
-                    int mediaPlaying = IsMediaPlaying();
+                    int mediaOnMonitor[MAX_MONITOR_COUNT] = {0};
+                    UpdateMediaMonitorStates(mediaOnMonitor);
 
-                    if (!mediaPlaying && idleTime > (DWORD)(g_app.config.idleTimeout * 1000)) {
-                        if (!g_app.screenSaverActive) {
-                            LogMessage("Timer: Activating screen saver (idle: %lums)", idleTime);
-                            ShowScreenSaver(0);
-                            UpdateTrayIcon(1);
+                    if (idleTime > (DWORD)(g_app.config.idleTimeout * 1000)) {
+                        int activatedCount = 0;
+
+                        for (int i = 0; i < g_monitorCount; i++) {
+                            if (!g_monitorStates[i].enabled) continue;
+
+                            if (mediaOnMonitor[i]) {
+                                if (g_monitorStates[i].screenSaverActive) {
+                                    LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
+                                    HideScreenSaverOnMonitor(i);
+                                }
+                            } else if (!g_monitorStates[i].screenSaverActive) {
+                                LogMessage("Timer: Activating screen saver on monitor %d (idle: %lums)", i, idleTime);
+                                ShowScreenSaverOnMonitor(i, 0);
+                                activatedCount++;
+                            }
                         }
+
+                        g_app.screenSaverActive = IsAnyMonitorActive() ? 1 : 0;
+
+                        if (!g_app.screenSaverActive) {
+                            EnsureCursorVisible("no active monitors");
+                        }
+
+                        if (activatedCount > 0) {
+                            LogMessage("Activated screen saver on %d monitor(s)", activatedCount);
+                        }
+
+                        UpdateTrayIcon(g_app.screenSaverActive);
                     } else {
                         if (g_app.screenSaverActive) {
                             if (g_app.isManualActivation) {
@@ -1612,7 +2083,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                                     }
                                 }
                             } else {
-                                LogMessage("Timer: Deactivating screen saver (idle: %lums, media: %d)", idleTime, mediaPlaying);
+                                LogMessage("Timer: Deactivating screen saver (idle: %lums)", idleTime);
                                 HideScreenSaver();
                                 UpdateTrayIcon(0);
                             }
@@ -1620,9 +2091,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     }
                 }
 
-                // Ensure screen saver windows stay on top (handles notifications like MS Teams)
-                if (IsAnyMonitorActive()) {
-                    EnsureScreenSaverTopmost();
+                // Ensure screen saver windows stay on top, but avoid a SetWindowPos loop every tick.
+                static DWORD lastTopmostRefresh = 0;
+                if (g_app.screenSaverActive) {
+                    DWORD nowTick = GetTickCount();
+                    if ((DWORD)(nowTick - lastTopmostRefresh) >= TOPMOST_REFRESH_INTERVAL_MS) {
+                        EnsureScreenSaverTopmost();
+                        lastTopmostRefresh = nowTick;
+                    }
+                } else {
+                    lastTopmostRefresh = 0;
                 }
             }
             break;
@@ -1641,10 +2119,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_app.screenSaverActive = 0;
             UpdateTrayIcon(0);
 
-            if (g_app.cursorHidden) {
-                ShowCursor(TRUE);
-                g_app.cursorHidden = 0;
-            }
+            EnsureCursorVisible("display configuration changed");
 
             // Re-enumerate monitors to detect added/removed displays
             int oldMonitorCount = g_monitorCount;
@@ -1679,6 +2154,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 POINT pt;
                 GetCursorPos(&pt);
                 SetForegroundWindow(hWnd);
+                g_app.trayMenuActive = 1;
+                EnsureCursorVisible("tray menu opened");
 
                 HMENU hMenu = CreatePopupMenu();
                 AppendMenuA(hMenu, MF_STRING, IDM_SETTINGS, "Settings...");
@@ -1687,7 +2164,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
                 TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
                 DestroyMenu(hMenu);
+                g_app.trayMenuActive = 0;
+                EnsureCursorVisible("tray menu closed");
             } else if (lParam == WM_LBUTTONDOWN) {
+                EnsureCursorVisible("tray icon clicked");
                 if (g_hSettingsDialog) {
                     LogMessage("User: Left-clicked tray icon - settings dialog already open, bringing to foreground");
                     SetForegroundWindow(g_hSettingsDialog);
@@ -1723,11 +2203,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_DESTROY:
             LogMessage("Application shutting down");
 
-            if (g_app.cursorHidden) {
-                ShowCursor(TRUE);
-                g_app.cursorHidden = 0;
-                LogMessage("Cursor restored on shutdown");
-            }
+            EnsureCursorVisible("shutdown");
 
             for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
                 if (g_monitorStates[i].hScreenSaverWnd) {

@@ -6,6 +6,26 @@ if (!(Test-Path -Path $buildDir -PathType Container)) {
 }
 Push-Location $buildDir
 
+function Import-EnvironmentLines {
+    param([string[]]$Lines)
+
+    $seenKeys = @{}
+    foreach ($line in $Lines) {
+        $key, $value = $line -split '=', 2
+        if ([string]::IsNullOrWhiteSpace($key) -or $key -eq "PROMPT") {
+            continue
+        }
+
+        $normalizedKey = $key.ToUpperInvariant()
+        if ($seenKeys.ContainsKey($normalizedKey)) {
+            continue
+        }
+
+        $seenKeys[$normalizedKey] = $true
+        Set-Item -Path "env:$key" -Value $value
+    }
+}
+
 $sourceFile = Join-Path $PSScriptRoot "src\oled_aegis.c"
 $resourceFile = Join-Path $PSScriptRoot "src\oled_aegis.rc"
 $outputExe = "oled_aegis.exe"
@@ -16,10 +36,7 @@ $resourceObj = "oled_aegis.res"
 # NOTE: delete cache file if MSVC setup changes.
 $envCache = Join-Path $buildDir "vc_env.txt"
 if (Test-Path $envCache) {
-    Get-Content $envCache | ForEach-Object {
-        $key, $value = $_ -split '=', 2
-        Set-Item -Path "env:$key" -Value $value
-    }
+    Import-EnvironmentLines (Get-Content $envCache)
 } else {
     $vsPath = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
     if (!(Test-Path $vsPath)) {
@@ -30,12 +47,7 @@ if (Test-Path $envCache) {
 
     $envVars = & "cmd.exe" /c "`"$vsPath`" x64 > nul && set"
     $envVars | Where-Object { $_ -notmatch '^PROMPT=' } > $envCache
-    foreach ($line in $envVars) {
-        $key, $value = $line -split '=', 2
-        if ($key -ne "PROMPT") {
-            Set-Item -Path "env:$key" -Value $value
-        }
-    }
+    Import-EnvironmentLines $envVars
 }
 
 # Check if source file exists
@@ -67,11 +79,11 @@ $linkResources = if (Test-Path $resourceObj) { $resourceObj } else { "" }
 if ($buildType -eq "debug") {
     # Debug Compile
     Write-Host "Configuration: Debug" -ForegroundColor Yellow
-    cl.exe -FC -Zi -MDd /D "INITGUID" "$sourceFile" /Fe:"$outputExe" /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib $linkResources
+    cl.exe -FC -Zi -MDd /D "INITGUID" "$sourceFile" /Fe:"$outputExe" /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib dwmapi.lib $linkResources
 } else {
     # Optimized Compile (Release)
     Write-Host "Configuration: Release (Optimized)" -ForegroundColor Yellow
-    cl.exe -O2 -FC -MD /D "INITGUID" "$sourceFile" /Fe:"$outputExe" /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib $linkResources
+    cl.exe -O2 -FC -MD /D "INITGUID" "$sourceFile" /Fe:"$outputExe" /link user32.lib shell32.lib ole32.lib uuid.lib gdi32.lib advapi32.lib comctl32.lib powrprof.lib psapi.lib dwmapi.lib $linkResources
 }
 
 if ($LASTEXITCODE -eq 0) {
