@@ -2,28 +2,24 @@
 
 A Windows screen saver app tailored for OLED monitors.
 
-## Why I made this
+## Why This Exists
 
-Recently, I purchased my first OLED monitor and discovered that Windows 11
-built-in screen saver has some issues:
+Windows 11's built-in screen saver can be awkward for OLED monitor setups:
 
 * Randomly not activating after putting the computer to sleep.
 * Breaks Bluetooth pause/play interactions when the screen saver is active.
 * **Does not provide a way to only turn on screen saver on one monitor in a
-  multi-monitor setup.** (I only want to enable the screen saver on my OLED
-  monitor)
-
-Solution: make my own screen saver app and give it a bad name.
+  multi-monitor setup.**
 
 OLED Aegis solves these problems by implementing a screen saver app in the
 simplest way possible: draw a black fullscreen window after a period of user
 inactivity on the specified monitors.
 
-> **Note**: It should work just fine on Windows 10, but I only tested it on Windows 11.
+> **Note**: It should work just fine on Windows 10, but Windows 11 is the primary tested target.
 
 ## Download & Installation
 
-Download the latest `oled_aegis.exe` from the [Releases page](https://github.com/spenserlee/oled_aegis/releases). No installation required - simply run the executable.
+Download the latest `oled_aegis.exe` from the [Releases page](https://github.com/Mxlted/oled_aegis/releases). No installation required - simply run the executable.
 
 For convenient access, you can place it in any folder and create a shortcut, or add it to your Windows startup folder.
 
