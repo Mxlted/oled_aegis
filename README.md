@@ -2,6 +2,18 @@
 
 A Windows screen saver app tailored for OLED monitors.
 
+## What's Different In This Fork
+
+This fork is maintained by [Mxlted](https://github.com/Mxlted). I made it because, at the time of this fork, the original OLED Aegis project did not yet include the per-monitor media and usability behavior I wanted for my own multi-monitor OLED setup.
+
+Reasons you may want this version:
+
+* **Per-monitor media awareness**: If YouTube or other media is playing on one monitor, only that monitor is protected from the screen saver. Other idle enabled monitors can still blank normally.
+* **Better browser video handling**: Non-fullscreen browser video windows are detected and mapped to the monitor they are actually visible on.
+* **Reduced monitor bleed-through detection**: Maximized browser windows with invisible Windows resize borders should not accidentally count as media playing on the neighboring monitor.
+* **Tray cursor fixes**: The mouse cursor is restored when using the tray icon, settings window, or context menu.
+* **Lightweight polling optimizations**: Media detection, tray icon updates, and topmost refreshes are throttled/cached so the app stays low overhead.
+
 ## Why This Exists
 
 Windows 11's built-in screen saver can be awkward for OLED monitor setups:
