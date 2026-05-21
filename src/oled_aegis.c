@@ -10,6 +10,7 @@
 #include <powerbase.h>
 #include <psapi.h>
 #include <dwmapi.h>
+#include "version.h"
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "psapi.lib")
@@ -38,6 +39,7 @@
 #define IDC_INTERVAL_EDIT       1008
 #define IDC_PERMONITOR_CHECK    1009
 #define IDC_PIXELSHIFT_EDIT     1010
+#define IDC_TWITCH_MEDIA_CHECK  1011
 #define IDC_MONITOR_BASE        2000  // Monitor checkboxes: IDC_MONITOR_BASE + index
 
 // Tray context menu command IDs
@@ -119,6 +121,7 @@ typedef struct {
     int weakMediaOnMonitor[MAX_MONITOR_COUNT];
     int strongWindowCount;
     int weakWindowCount;
+    int ignoredTwitchWindowCount;
 } MediaWindowEnumContext;
 
 typedef struct {
@@ -131,6 +134,7 @@ typedef struct {
     int debugMode;
     int perMonitorInputDetection;
     int pixelShiftCompensation;
+    int allowScreenSaverDuringTwitchMedia;
 } Config;
 
 typedef struct {
@@ -180,6 +184,7 @@ void ClampConfigValues() {
     g_app.config.startupEnabled = g_app.config.startupEnabled ? 1 : 0;
     g_app.config.debugMode = g_app.config.debugMode ? 1 : 0;
     g_app.config.perMonitorInputDetection = g_app.config.perMonitorInputDetection ? 1 : 0;
+    g_app.config.allowScreenSaverDuringTwitchMedia = g_app.config.allowScreenSaverDuringTwitchMedia ? 1 : 0;
 }
 
 int IsAppUiActive() {
@@ -612,6 +617,8 @@ void LoadConfig() {
                     g_app.config.mediaDetectionEnabled = atoi(value);
                 } else if (strcmp(key, "mediaDetectionEnabled") == 0) {
                     g_app.config.mediaDetectionEnabled = atoi(value);
+                } else if (strcmp(key, "allowScreenSaverDuringTwitchMedia") == 0) {
+                    g_app.config.allowScreenSaverDuringTwitchMedia = atoi(value);
                 } else if (strcmp(key, "startupEnabled") == 0) {
                     g_app.config.startupEnabled = atoi(value);
                 } else if (strcmp(key, "debugMode") == 0) {
@@ -686,6 +693,7 @@ void SaveConfig() {
         fprintf(f, "idleTimeout=%d\n", g_app.config.idleTimeout);
         fprintf(f, "checkInterval=%d\n", g_app.config.checkInterval);
         fprintf(f, "mediaDetectionEnabled=%d\n", g_app.config.mediaDetectionEnabled);
+        fprintf(f, "allowScreenSaverDuringTwitchMedia=%d\n", g_app.config.allowScreenSaverDuringTwitchMedia);
         fprintf(f, "startupEnabled=%d\n", g_app.config.startupEnabled);
         fprintf(f, "debugMode=%d\n", g_app.config.debugMode);
         fprintf(f, "perMonitorInputDetection=%d\n", g_app.config.perMonitorInputDetection);
@@ -977,6 +985,14 @@ int WindowTitleHasMediaHint(const char* title) {
     return 0;
 }
 
+int IsTwitchMediaWindow(const char* processName, const char* title) {
+    if (!IsKnownBrowserProcess(processName)) {
+        return 0;
+    }
+
+    return ContainsIgnoreCase(title, "Twitch") || ContainsIgnoreCase(title, "twitch.tv");
+}
+
 int GetMediaWindowCandidateStrength(const char* processName, const char* title) {
     if (IsKnownMediaProcess(processName)) {
         return 2;
@@ -1096,6 +1112,11 @@ BOOL CALLBACK EnumMediaWindowCallback(HWND hWnd, LPARAM lParam) {
     char title[512] = {0};
     GetWindowTextA(hWnd, title, sizeof(title));
 
+    if (g_app.config.allowScreenSaverDuringTwitchMedia && IsTwitchMediaWindow(processName, title)) {
+        ctx->ignoredTwitchWindowCount++;
+        return TRUE;
+    }
+
     int strength = GetMediaWindowCandidateStrength(processName, title);
     if (strength == 0) {
         return TRUE;
@@ -1117,9 +1138,19 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
     static int hasCachedState = 0;
     static int cachedAnyMedia = 0;
     static int cachedMediaOnMonitor[MAX_MONITOR_COUNT] = {0};
+    static int cachedMediaDetectionEnabled = -1;
+    static int cachedTwitchMediaBypass = -1;
 
     for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
         mediaOnMonitor[i] = 0;
+    }
+
+    if (cachedMediaDetectionEnabled != g_app.config.mediaDetectionEnabled ||
+        cachedTwitchMediaBypass != g_app.config.allowScreenSaverDuringTwitchMedia) {
+        hasCachedState = 0;
+        lastLoggedMask = (DWORD)-1;
+        cachedMediaDetectionEnabled = g_app.config.mediaDetectionEnabled;
+        cachedTwitchMediaBypass = g_app.config.allowScreenSaverDuringTwitchMedia;
     }
 
     if (!g_app.config.mediaDetectionEnabled) {
@@ -1161,6 +1192,7 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
     EnumWindows(EnumMediaWindowCallback, (LPARAM)&ctx);
 
     int usedGlobalFallback = 0;
+    int usedTwitchBypass = 0;
     int mappedMonitorCount = 0;
     if (ctx.strongWindowCount > 0) {
         for (int i = 0; i < g_monitorCount; i++) {
@@ -1169,14 +1201,18 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
         }
     }
 
-    if (mappedMonitorCount == 0 && ctx.weakWindowCount > 0) {
+    if (mappedMonitorCount == 0 && ctx.strongWindowCount == 0 && ctx.ignoredTwitchWindowCount > 0) {
+        // When Twitch playback is explicitly allowed to be covered, treat the global
+        // Windows media signal as explained by the ignored Twitch browser window.
+        usedTwitchBypass = 1;
+    } else if (mappedMonitorCount == 0 && ctx.weakWindowCount > 0) {
         for (int i = 0; i < g_monitorCount; i++) {
             mediaOnMonitor[i] = ctx.weakMediaOnMonitor[i];
             if (mediaOnMonitor[i]) mappedMonitorCount++;
         }
     }
 
-    if (mappedMonitorCount == 0) {
+    if (mappedMonitorCount == 0 && !usedTwitchBypass) {
         // If Windows reports media playback but we cannot map it to a visible window, keep
         // the previous conservative behavior so playback is not accidentally covered.
         for (int i = 0; i < g_monitorCount; i++) {
@@ -1199,8 +1235,9 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
     }
 
     if (mask != lastLoggedMask) {
-        LogMessage("Media monitor detection: mask=0x%08X (strongWindows=%d, weakWindows=%d, fallback=%d)",
-                   mask, ctx.strongWindowCount, ctx.weakWindowCount, usedGlobalFallback);
+        LogMessage("Media monitor detection: mask=0x%08X (strongWindows=%d, weakWindows=%d, ignoredTwitchWindows=%d, twitchBypass=%d, fallback=%d)",
+                   mask, ctx.strongWindowCount, ctx.weakWindowCount, ctx.ignoredTwitchWindowCount,
+                   usedTwitchBypass, usedGlobalFallback);
         lastLoggedMask = mask;
     }
 
@@ -1648,6 +1685,11 @@ void ShowSettingsDialog() {
                      margin, y, checkboxWidth, controlHeight, g_hSettingsDialog, (HMENU)IDC_MEDIA_CHECK, hMod, NULL);
         y += rowHeight;
 
+        HWND hTwitchCheck = CreateWindowA("BUTTON", "Allow Screen Saver During Twitch Playback",
+                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                     margin, y, checkboxWidth, controlHeight, g_hSettingsDialog, (HMENU)IDC_TWITCH_MEDIA_CHECK, hMod, NULL);
+        y += rowHeight;
+
         HWND hDebugCheck = CreateWindowA("BUTTON", "Debug Mode",
                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                      margin, y, checkboxWidth, controlHeight, g_hSettingsDialog, (HMENU)IDC_DEBUG_CHECK, hMod, NULL);
@@ -1716,6 +1758,7 @@ void ShowSettingsDialog() {
             SendMessageA(hIntervalEdit, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hIntervalUpDown, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hVideoCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
+            SendMessageA(hTwitchCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hDebugCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hStartupCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPerMonitorCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
@@ -1735,6 +1778,8 @@ void ShowSettingsDialog() {
                    "How often to poll for user activity. (250-10000ms).");
         AddTooltip(g_hSettingsDialog, hVideoCheck,
                    "Prevent screen saver activation on monitors with visible media playback.");
+        AddTooltip(g_hSettingsDialog, hTwitchCheck,
+                   "Allow the screen saver to activate over Twitch browser playback, useful for Twitch Drops when you are away.");
         AddTooltip(g_hSettingsDialog, hDebugCheck,
                    "Enable debug logging to %APPDATA%\\OLED_Aegis\\oled_aegis_debug.log");
         AddTooltip(g_hSettingsDialog, hStartupCheck,
@@ -1754,6 +1799,7 @@ void ShowSettingsDialog() {
         SetDlgItemTextA(g_hSettingsDialog, IDC_INTERVAL_EDIT, buffer);
 
         CheckDlgButton(g_hSettingsDialog, IDC_MEDIA_CHECK, g_app.config.mediaDetectionEnabled ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(g_hSettingsDialog, IDC_TWITCH_MEDIA_CHECK, g_app.config.allowScreenSaverDuringTwitchMedia ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(g_hSettingsDialog, IDC_DEBUG_CHECK, g_app.config.debugMode ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(g_hSettingsDialog, IDC_STARTUP_CHECK, g_app.config.startupEnabled ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(g_hSettingsDialog, IDC_PERMONITOR_CHECK, g_app.config.perMonitorInputDetection ? BST_CHECKED : BST_UNCHECKED);
@@ -1781,11 +1827,13 @@ void ApplySettings(HWND hWnd) {
     g_app.config.checkInterval = atoi(buffer);
 
     int oldMedia = g_app.config.mediaDetectionEnabled;
+    int oldTwitchMedia = g_app.config.allowScreenSaverDuringTwitchMedia;
     int oldDebug = g_app.config.debugMode;
     int oldStartup = g_app.config.startupEnabled;
     int oldPerMonitor = g_app.config.perMonitorInputDetection;
 
     g_app.config.mediaDetectionEnabled = IsDlgButtonChecked(hWnd, IDC_MEDIA_CHECK) == BST_CHECKED;
+    g_app.config.allowScreenSaverDuringTwitchMedia = IsDlgButtonChecked(hWnd, IDC_TWITCH_MEDIA_CHECK) == BST_CHECKED;
     g_app.config.debugMode = IsDlgButtonChecked(hWnd, IDC_DEBUG_CHECK) == BST_CHECKED;
     g_app.config.startupEnabled = IsDlgButtonChecked(hWnd, IDC_STARTUP_CHECK) == BST_CHECKED;
     g_app.config.perMonitorInputDetection = IsDlgButtonChecked(hWnd, IDC_PERMONITOR_CHECK) == BST_CHECKED;
@@ -1827,10 +1875,11 @@ void ApplySettings(HWND hWnd) {
     SaveConfig();
     UpdateStartupRegistry();
 
-    LogMessage("Settings applied: timeout %ds->%ds, interval %dms->%dms, media %d->%d, debug %d->%d, startup %d->%d, perMonitor %d->%d, pixelShift %dpx",
+    LogMessage("Settings applied: timeout %ds->%ds, interval %dms->%dms, media %d->%d, twitchMediaBypass %d->%d, debug %d->%d, startup %d->%d, perMonitor %d->%d, pixelShift %dpx",
              oldTimeout, g_app.config.idleTimeout,
              oldInterval, g_app.config.checkInterval,
              oldMedia, g_app.config.mediaDetectionEnabled,
+             oldTwitchMedia, g_app.config.allowScreenSaverDuringTwitchMedia,
              oldDebug, g_app.config.debugMode,
              oldStartup, g_app.config.startupEnabled,
              oldPerMonitor, g_app.config.perMonitorInputDetection,
@@ -1899,6 +1948,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_app.config.idleTimeout = DEFAULT_IDLE_TIMEOUT;
             g_app.config.checkInterval = 1000;
             g_app.config.mediaDetectionEnabled = 1;
+            g_app.config.allowScreenSaverDuringTwitchMedia = 0;
             g_app.config.startupEnabled = 0;
             g_app.config.debugMode = 0;
             g_app.config.perMonitorInputDetection = 0;
@@ -1926,8 +1976,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             UpdateStartupRegistry();
 
-            LogMessage("Application started. Timeout: %ds, Media: %d, Debug: %d",
-                     g_app.config.idleTimeout, g_app.config.mediaDetectionEnabled, g_app.config.debugMode);
+            LogMessage("Application started. Version: %s, Timeout: %ds, Media: %d, TwitchMediaBypass: %d, Debug: %d",
+                     APP_VERSION_STRING, g_app.config.idleTimeout, g_app.config.mediaDetectionEnabled,
+                     g_app.config.allowScreenSaverDuringTwitchMedia, g_app.config.debugMode);
 
             g_blackBrush = CreateSolidBrush(RGB(0, 0, 0));
 

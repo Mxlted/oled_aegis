@@ -2,15 +2,19 @@
 
 A Windows screen saver app tailored for OLED monitors.
 
+Current version: `1.1.0`
+
 ## What's Different In This Fork
 
-This fork is maintained by [Mxlted](https://github.com/Mxlted). I made it because, at the time of this fork, the original OLED Aegis project did not yet include the per-monitor media and usability behavior I wanted for my own multi-monitor OLED setup.
+This fork is maintained by [Mxlted](https://github.com/Mxlted). It focuses on multi-monitor OLED setups where each display may need different screen saver behavior depending on where input and media playback are actually happening.
 
 Reasons you may want this version:
 
 * **Per-monitor media awareness**: If YouTube or other media is playing on one monitor, only that monitor is protected from the screen saver. Other idle enabled monitors can still blank normally.
+* **Twitch Drops mode**: Optionally allow the screen saver during Twitch browser playback, so Drops can keep progressing while the display is protected.
 * **Better browser video handling**: Non-fullscreen browser video windows are detected and mapped to the monitor they are actually visible on.
 * **Reduced monitor bleed-through detection**: Maximized browser windows with invisible Windows resize borders should not accidentally count as media playing on the neighboring monitor.
+* **Per-monitor input detection**: Unused monitors can activate independently while you keep working on another monitor.
 * **Tray cursor fixes**: The mouse cursor is restored when using the tray icon, settings window, or context menu.
 * **Lightweight polling optimizations**: Media detection, tray icon updates, and topmost refreshes are throttled/cached so the app stays low overhead.
 
@@ -58,6 +62,7 @@ Configuration is stored in `%APPDATA%\OLED_Aegis\oled_aegis.ini`. This file is c
 * **checkInterval**: Milliseconds between idle time checks (default: 1000ms, min: 250ms, max: 10000ms)
 * **pixelShiftCompensation**: Pixels to expand the screen saver window beyond the monitor's reported bounds on each side (default: 0, disabled). Set to `4`–`8` if your QD-OLED panel's hardware pixel shift feature causes a thin strip of the desktop to appear at the screen edge during screen saver activation.
 * **mediaDetectionEnabled**: Set to `1` to prevent screen saver on monitors with visible media playback, `0` to disable (default: 1)
+* **allowScreenSaverDuringTwitchMedia**: Set to `1` to allow the screen saver over Twitch browser playback, useful for Twitch Drops when you are away (default: 0)
 * **startupEnabled**: Set to `1` to run at Windows startup, `0` to disable (default: 0)
 * **debugMode**: Set to `1` to enable debug logging to `%APPDATA%\OLED_Aegis\oled_aegis_debug.log`, `0` to disable (default: 0). **Note:** only for troubleshooting issues.
 * **perMonitorInputDetection**: Set to `1` to track input separately for each monitor (default: 0). When enabled, each monitor has its own idle timer based on mouse cursor position and focused window location. This allows the screen saver to activate on unused monitors while you continue working on others.
@@ -80,6 +85,8 @@ Configuration is stored in `%APPDATA%\OLED_Aegis\oled_aegis.ini`. This file is c
 The screen saver will automatically activate on enabled monitors without visible media playback when:
 1. No user input (keyboard/mouse) for `idleTimeout` seconds
 2. No media is playing on that monitor (if `mediaDetectionEnabled=1`)
+
+If `allowScreenSaverDuringTwitchMedia=1`, Twitch browser playback is ignored by media detection so the screen saver can still activate while Twitch Drops continue playing.
 
 The screen saver will automatically deactivate from monitors when:
 1. Any user input is detected
