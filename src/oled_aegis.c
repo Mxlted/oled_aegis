@@ -10,11 +10,27 @@
 #include <powerbase.h>
 #include <psapi.h>
 #include <dwmapi.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#include <endpointvolume.h>
 #include "version.h"
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "dwmapi.lib")
+
+const IID IID_IMMDeviceEnumerator = {
+    0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}
+};
+const CLSID CLSID_MMDeviceEnumerator = {
+    0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}
+};
+const IID IID_IAudioSessionManager2 = {
+    0x77aa99a0, 0x1bd6, 0x484f, {0x8b, 0xc7, 0x2c, 0x65, 0x4c, 0x9a, 0x9b, 0x6f}
+};
+const IID IID_IAudioMeterInformation = {
+    0xc02216f6, 0x8c67, 0x4b5b, {0x9d, 0x00, 0xd0, 0x08, 0xe7, 0x3e, 0x00, 0x64}
+};
 
 #define APP_NAME L"OLED Aegis"
 #define WM_TRAYICON (WM_USER + 1)
@@ -56,6 +72,7 @@
 #define MIN_MEDIA_WINDOW_AREA       10000   // Ignore tiny windows when mapping media to monitors
 #define MIN_MEDIA_WINDOW_OVERLAP_RATIO 0.10 // Ignore thin window-border overlap onto adjacent monitors
 #define MEDIA_DETECTION_CACHE_MS    2000    // Cache media-window scans to keep timer work light
+#define AUDIO_ACTIVE_PEAK_THRESHOLD 0.0001f // Ignore paused/silent sessions that remain "active"
 #define TOPMOST_REFRESH_INTERVAL_MS 5000    // Reassert topmost occasionally, not every timer tick
 #define CURSOR_COUNTER_MAX_ATTEMPTS 16      // Safety bound when normalizing ShowCursor's counter
 
@@ -815,6 +832,114 @@ void EnumerateMonitors() {
     LogMessage("Enumerated %d monitors", g_monitorCount);
 }
 
+int IsAudiblePlaybackActive() {
+    static int lastAudioState = -1;
+    int isActive = 0;
+    float highestPeak = 0.0f;
+    int shouldUninitialize = 0;
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) {
+        shouldUninitialize = 1;
+    } else if (hr != RPC_E_CHANGED_MODE) {
+        if (lastAudioState != 0) {
+            LogMessage("Audio detection: CoInitializeEx failed with hr=0x%08X", (unsigned int)hr);
+            lastAudioState = 0;
+        }
+        return 0;
+    }
+
+    IMMDeviceEnumerator* deviceEnumerator = NULL;
+    IMMDevice* defaultDevice = NULL;
+    IAudioSessionManager2* sessionManager = NULL;
+    IAudioSessionEnumerator* sessionEnumerator = NULL;
+
+    hr = CoCreateInstance(
+        &CLSID_MMDeviceEnumerator,
+        NULL,
+        CLSCTX_ALL,
+        &IID_IMMDeviceEnumerator,
+        (void**)&deviceEnumerator
+    );
+
+    if (SUCCEEDED(hr)) {
+        hr = deviceEnumerator->lpVtbl->GetDefaultAudioEndpoint(
+            deviceEnumerator,
+            eRender,
+            eMultimedia,
+            &defaultDevice
+        );
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = defaultDevice->lpVtbl->Activate(
+            defaultDevice,
+            &IID_IAudioSessionManager2,
+            CLSCTX_ALL,
+            NULL,
+            (void**)&sessionManager
+        );
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = sessionManager->lpVtbl->GetSessionEnumerator(sessionManager, &sessionEnumerator);
+    }
+
+    if (SUCCEEDED(hr)) {
+        int sessionCount = 0;
+        if (SUCCEEDED(sessionEnumerator->lpVtbl->GetCount(sessionEnumerator, &sessionCount))) {
+            for (int i = 0; i < sessionCount; i++) {
+                IAudioSessionControl* sessionControl = NULL;
+                if (SUCCEEDED(sessionEnumerator->lpVtbl->GetSession(sessionEnumerator, i, &sessionControl))) {
+                    AudioSessionState sessionState = AudioSessionStateInactive;
+                    if (SUCCEEDED(sessionControl->lpVtbl->GetState(sessionControl, &sessionState)) &&
+                        sessionState == AudioSessionStateActive) {
+                        IAudioMeterInformation* meterInformation = NULL;
+                        if (SUCCEEDED(sessionControl->lpVtbl->QueryInterface(
+                                sessionControl,
+                                &IID_IAudioMeterInformation,
+                                (void**)&meterInformation))) {
+                            float peak = 0.0f;
+                            if (SUCCEEDED(meterInformation->lpVtbl->GetPeakValue(meterInformation, &peak))) {
+                                if (peak > highestPeak) {
+                                    highestPeak = peak;
+                                }
+
+                                if (peak > AUDIO_ACTIVE_PEAK_THRESHOLD) {
+                                    isActive = 1;
+                                }
+                            }
+                            meterInformation->lpVtbl->Release(meterInformation);
+                        }
+                    }
+                    sessionControl->lpVtbl->Release(sessionControl);
+                }
+
+                if (isActive) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (sessionEnumerator) sessionEnumerator->lpVtbl->Release(sessionEnumerator);
+    if (sessionManager) sessionManager->lpVtbl->Release(sessionManager);
+    if (defaultDevice) defaultDevice->lpVtbl->Release(defaultDevice);
+    if (deviceEnumerator) deviceEnumerator->lpVtbl->Release(deviceEnumerator);
+
+    if (shouldUninitialize) {
+        CoUninitialize();
+    }
+
+    if (isActive != lastAudioState) {
+        LogMessage("Audio detection: state changed to %s (peak=%.6f)",
+                   isActive ? "ACTIVE" : "INACTIVE", highestPeak);
+        lastAudioState = isActive;
+    }
+
+    return isActive;
+}
+
 int IsMediaPlaying() {
     static int lastMediaState = -1;
 
@@ -830,11 +955,14 @@ int IsMediaPlaying() {
     );
 
     if (status == 0) {
-        int isPlaying = (executionState & ES_DISPLAY_REQUIRED) != 0;
+        int displayRequired = (executionState & ES_DISPLAY_REQUIRED) != 0;
+        int audioActive = IsAudiblePlaybackActive();
+        // Browser pages can keep ES_DISPLAY_REQUIRED and audio sessions active even when paused.
+        int isPlaying = displayRequired && audioActive;
         // Only log when state changes to reduce noise
         if (isPlaying != lastMediaState) {
-            LogMessage("Media detection: state changed to %s (executionState=0x%08X)",
-                     isPlaying ? "PLAYING" : "NOT_PLAYING", executionState);
+            LogMessage("Media detection: state changed to %s (displayRequired=%d, audioActive=%d, executionState=0x%08X)",
+                     isPlaying ? "PLAYING" : "NOT_PLAYING", displayRequired, audioActive, executionState);
             lastMediaState = isPlaying;
         }
         return isPlaying;
