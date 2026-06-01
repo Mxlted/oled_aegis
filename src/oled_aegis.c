@@ -35,6 +35,7 @@ const IID IID_IAudioMeterInformation = {
 #define APP_NAME L"OLED Aegis"
 #define WM_TRAYICON (WM_USER + 1)
 #define TIMER_IDLE_CHECK 1
+#define TIMER_TRAY_ACTIVATION_SETTLE 2
 #define DEFAULT_IDLE_TIMEOUT 300
 #define MAX_LOG_SIZE_BYTES (1 * 1024 * 1024)  // 1 MB log file size limit
 #define MANUAL_ACTIVATION_COOLDOWN_MS 2500
@@ -74,6 +75,7 @@ const IID IID_IAudioMeterInformation = {
 #define MEDIA_DETECTION_CACHE_MS    2000    // Cache media-window scans to keep timer work light
 #define AUDIO_ACTIVE_PEAK_THRESHOLD 0.0001f // Ignore paused/silent sessions that remain "active"
 #define TOPMOST_REFRESH_INTERVAL_MS 5000    // Reassert topmost occasionally, not every timer tick
+#define TRAY_ACTIVATION_SETTLE_MS   150     // Let Explorer finish a tray click before reasserting topmost
 #define CURSOR_COUNTER_MAX_ATTEMPTS 16      // Safety bound when normalizing ShowCursor's counter
 
 // Check interval bounds (milliseconds)
@@ -104,6 +106,8 @@ void ShowScreenSaverOnMonitor(int monitorIndex, int isManual);
 void HideScreenSaver();
 void HideScreenSaverOnMonitor(int monitorIndex);
 int IsAnyMonitorActive();
+void EnsureScreenSaverTopmost();
+void FinishScreenSaverActivation(const char* reason);
 void UpdateTrayIcon(int active);
 void LogMessage(const char* format, ...);
 int FindMonitorByDeviceName(const char* deviceName);
@@ -1609,7 +1613,10 @@ void ShowScreenSaver(int isManual) {
 
     LogMessage("Activated screen saver on %d monitors", windowsCreated);
 
-    g_app.screenSaverActive = 1;
+    g_app.screenSaverActive = IsAnyMonitorActive() ? 1 : 0;
+    if (g_app.screenSaverActive) {
+        FinishScreenSaverActivation(isManual ? "manual screen saver activation" : "screen saver activation");
+    }
 }
 
 void HideScreenSaver() {
@@ -1626,6 +1633,9 @@ void HideScreenSaver() {
     g_app.screenSaverActive = 0;
     g_app.manualActivationTime = 0;
     g_app.isManualActivation = 0;
+    if (g_app.hWnd) {
+        KillTimer(g_app.hWnd, TIMER_TRAY_ACTIVATION_SETTLE);
+    }
 
     EnsureCursorVisible("screen saver hidden");
 }
@@ -1638,6 +1648,11 @@ void EnsureScreenSaverTopmost() {
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
+}
+
+void FinishScreenSaverActivation(const char* reason) {
+    EnsureScreenSaverTopmost();
+    HideCursorForScreenSaver(reason ? reason : "screen saver activation");
 }
 
 void OpenConfigFileLocation() {
@@ -2128,7 +2143,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             break;
 
         case WM_TIMER:
-            if (wParam == TIMER_IDLE_CHECK) {
+            if (wParam == TIMER_TRAY_ACTIVATION_SETTLE) {
+                KillTimer(hWnd, TIMER_TRAY_ACTIVATION_SETTLE);
+                g_app.screenSaverActive = IsAnyMonitorActive() ? 1 : 0;
+                if (g_app.screenSaverActive) {
+                    FinishScreenSaverActivation("manual tray activation settled");
+                }
+            } else if (wParam == TIMER_IDLE_CHECK) {
                 // Skip all processing if no monitors have screen saver enabled
                 if (!IsAnyMonitorEnabled()) {
                     break;
@@ -2351,9 +2372,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 DestroyMenu(hMenu);
                 g_app.trayMenuActive = 0;
                 EnsureCursorVisible("tray menu closed");
-            } else if (lParam == WM_LBUTTONDOWN) {
-                EnsureCursorVisible("tray icon clicked");
+            } else if (lParam == WM_LBUTTONUP) {
                 if (g_hSettingsDialog) {
+                    EnsureCursorVisible("tray icon clicked");
                     LogMessage("User: Left-clicked tray icon - settings dialog already open, bringing to foreground");
                     SetForegroundWindow(g_hSettingsDialog);
                 } else {
@@ -2364,7 +2385,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     } else {
                         LogMessage("User: Left-clicked tray icon - activating screen saver (manual)");
                         ShowScreenSaver(1);
-                        UpdateTrayIcon(1);
+                        UpdateTrayIcon(g_app.screenSaverActive);
+                        if (g_app.screenSaverActive) {
+                            FinishScreenSaverActivation("manual tray activation");
+                            SetTimer(hWnd, TIMER_TRAY_ACTIVATION_SETTLE, TRAY_ACTIVATION_SETTLE_MS, NULL);
+                        }
                     }
                 }
             }

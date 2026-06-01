@@ -2,7 +2,7 @@
 
 A Windows screen saver app tailored for OLED monitors.
 
-Current version: `1.2`
+Current version: `1.2.1`
 
 ## What's Different In This Fork
 
