@@ -2,7 +2,7 @@
 
 A Windows screen saver app tailored for OLED monitors.
 
-Current version: `1.2.1`
+Current version: `1.2.2`
 
 ## What's Different In This Fork
 
@@ -49,6 +49,7 @@ For convenient access, you can place it in any folder and create a shortcut, or 
 * **Simple Configuration**: Edit a plain text INI file or use the system tray menu
 * **System Tray Integration**: Taskbar icon for easy control
 * **Startup Support**: Automatically run when Windows starts
+* **Settings Themes**: Light, dark, and pure-black OLED themes for the settings window
 
 ## Configuration
 
@@ -66,6 +67,7 @@ Configuration is stored in `%APPDATA%\OLED_Aegis\oled_aegis.ini`. This file is c
 * **startupEnabled**: Set to `1` to run at Windows startup, `0` to disable (default: 0)
 * **debugMode**: Set to `1` to enable debug logging to `%APPDATA%\OLED_Aegis\oled_aegis_debug.log`, `0` to disable (default: 0). **Note:** only for troubleshooting issues.
 * **perMonitorInputDetection**: Set to `1` to track input separately for each monitor (default: 0). When enabled, each monitor has its own idle timer based on mouse cursor position and focused window location. This allows the screen saver to activate on unused monitors while you continue working on others.
+* **uiTheme**: Settings window theme. `0` = Light, `1` = Dark, `2` = OLED pure black (default: 0)
 * **monitorEnabled_\<device\>**: Set to `1` to enable screen saver on the specified monitor, `0` to disable (default: 1 for all).
 
 ## Usage

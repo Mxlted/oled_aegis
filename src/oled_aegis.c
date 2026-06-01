@@ -57,6 +57,7 @@ const IID IID_IAudioMeterInformation = {
 #define IDC_PERMONITOR_CHECK    1009
 #define IDC_PIXELSHIFT_EDIT     1010
 #define IDC_TWITCH_MEDIA_CHECK  1011
+#define IDC_THEME_COMBO         1012
 #define IDC_MONITOR_BASE        2000  // Monitor checkboxes: IDC_MONITOR_BASE + index
 
 // Tray context menu command IDs
@@ -89,6 +90,17 @@ const IID IID_IAudioMeterInformation = {
 // Pixel shift compensation bounds (pixels)
 #define MIN_PIXEL_SHIFT_COMPENSATION    0
 #define MAX_PIXEL_SHIFT_COMPENSATION    1024
+
+// Settings UI themes
+#define UI_THEME_LIGHT  0
+#define UI_THEME_DARK   1
+#define UI_THEME_OLED   2
+#define UI_THEME_MAX    UI_THEME_OLED
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#define DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY 19
 
 // Device name prefix for display devices (e.g., "\\.\DISPLAY1")
 #define DEVICE_NAME_PREFIX      "\\\\.\\"
@@ -156,7 +168,20 @@ typedef struct {
     int perMonitorInputDetection;
     int pixelShiftCompensation;
     int allowScreenSaverDuringTwitchMedia;
+    int uiTheme;
 } Config;
+
+typedef struct {
+    COLORREF background;
+    COLORREF controlBackground;
+    COLORREF text;
+    COLORREF disabledText;
+    COLORREF buttonBackground;
+    COLORREF buttonHot;
+    COLORREF buttonPressed;
+    COLORREF border;
+    COLORREF focus;
+} SettingsThemeColors;
 
 typedef struct {
     HWND hWnd;
@@ -181,6 +206,10 @@ static HFONT g_hSettingsFont = NULL;
 static HICON g_hIconActive = NULL;
 static HICON g_hIconInactive = NULL;
 static HWND g_hTooltipControl = NULL;
+static HBRUSH g_hSettingsBackgroundBrush = NULL;
+static HBRUSH g_hSettingsControlBrush = NULL;
+static SettingsThemeColors g_settingsColors = {0};
+static int g_settingsBrushTheme = -1;
 static int g_monitorCount = 0;
 static int g_currentMonitorIndex = 0;
 static MonitorInfo g_monitors[MAX_MONITOR_COUNT];
@@ -206,10 +235,156 @@ void ClampConfigValues() {
     g_app.config.debugMode = g_app.config.debugMode ? 1 : 0;
     g_app.config.perMonitorInputDetection = g_app.config.perMonitorInputDetection ? 1 : 0;
     g_app.config.allowScreenSaverDuringTwitchMedia = g_app.config.allowScreenSaverDuringTwitchMedia ? 1 : 0;
+    g_app.config.uiTheme = ClampInt(g_app.config.uiTheme, UI_THEME_LIGHT, UI_THEME_MAX);
 }
 
 int IsAppUiActive() {
     return g_app.trayMenuActive || g_hSettingsDialog != NULL;
+}
+
+int IsDarkSettingsTheme() {
+    return g_app.config.uiTheme == UI_THEME_DARK || g_app.config.uiTheme == UI_THEME_OLED;
+}
+
+const char* GetUiThemeName(int theme) {
+    switch (theme) {
+        case UI_THEME_DARK:
+            return "Dark";
+        case UI_THEME_OLED:
+            return "OLED";
+        case UI_THEME_LIGHT:
+        default:
+            return "Light";
+    }
+}
+
+void DeleteSettingsThemeBrushes() {
+    if (g_hSettingsBackgroundBrush) {
+        DeleteObject(g_hSettingsBackgroundBrush);
+        g_hSettingsBackgroundBrush = NULL;
+    }
+
+    if (g_hSettingsControlBrush) {
+        DeleteObject(g_hSettingsControlBrush);
+        g_hSettingsControlBrush = NULL;
+    }
+
+    g_settingsBrushTheme = -1;
+}
+
+void UpdateSettingsThemeResources() {
+    int theme = g_app.config.uiTheme;
+    if (g_settingsBrushTheme == theme) {
+        return;
+    }
+
+    DeleteSettingsThemeBrushes();
+
+    if (theme == UI_THEME_OLED) {
+        g_settingsColors.background = RGB(0, 0, 0);
+        g_settingsColors.controlBackground = RGB(8, 8, 8);
+        g_settingsColors.text = RGB(246, 248, 250);
+        g_settingsColors.disabledText = RGB(112, 112, 112);
+        g_settingsColors.buttonBackground = RGB(14, 14, 14);
+        g_settingsColors.buttonHot = RGB(26, 32, 30);
+        g_settingsColors.buttonPressed = RGB(6, 28, 24);
+        g_settingsColors.border = RGB(64, 64, 64);
+        g_settingsColors.focus = RGB(0, 200, 170);
+    } else if (theme == UI_THEME_DARK) {
+        g_settingsColors.background = RGB(30, 31, 36);
+        g_settingsColors.controlBackground = RGB(42, 44, 50);
+        g_settingsColors.text = RGB(242, 244, 248);
+        g_settingsColors.disabledText = RGB(135, 139, 148);
+        g_settingsColors.buttonBackground = RGB(48, 51, 58);
+        g_settingsColors.buttonHot = RGB(58, 64, 72);
+        g_settingsColors.buttonPressed = RGB(36, 47, 54);
+        g_settingsColors.border = RGB(86, 91, 102);
+        g_settingsColors.focus = RGB(59, 189, 214);
+    } else {
+        g_settingsColors.background = GetSysColor(COLOR_WINDOW);
+        g_settingsColors.controlBackground = GetSysColor(COLOR_WINDOW);
+        g_settingsColors.text = GetSysColor(COLOR_WINDOWTEXT);
+        g_settingsColors.disabledText = GetSysColor(COLOR_GRAYTEXT);
+        g_settingsColors.buttonBackground = GetSysColor(COLOR_BTNFACE);
+        g_settingsColors.buttonHot = GetSysColor(COLOR_BTNHIGHLIGHT);
+        g_settingsColors.buttonPressed = GetSysColor(COLOR_BTNSHADOW);
+        g_settingsColors.border = GetSysColor(COLOR_BTNSHADOW);
+        g_settingsColors.focus = GetSysColor(COLOR_HIGHLIGHT);
+    }
+
+    if (IsDarkSettingsTheme()) {
+        g_hSettingsBackgroundBrush = CreateSolidBrush(g_settingsColors.background);
+        g_hSettingsControlBrush = CreateSolidBrush(g_settingsColors.controlBackground);
+    }
+
+    g_settingsBrushTheme = theme;
+}
+
+void ApplySettingsTitleBarTheme(HWND hWnd) {
+    if (!hWnd) return;
+
+    BOOL useDark = IsDarkSettingsTheme() ? TRUE : FALSE;
+    HRESULT hr = DwmSetWindowAttribute(
+        hWnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &useDark,
+        sizeof(useDark)
+    );
+
+    if (FAILED(hr)) {
+        DwmSetWindowAttribute(
+            hWnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY,
+            &useDark,
+            sizeof(useDark)
+        );
+    }
+}
+
+void RefreshSettingsDialogTheme(HWND hWnd) {
+    if (!hWnd) return;
+
+    UpdateSettingsThemeResources();
+    ApplySettingsTitleBarTheme(hWnd);
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+void DrawSettingsButton(const DRAWITEMSTRUCT* drawItem) {
+    if (!drawItem) return;
+
+    UpdateSettingsThemeResources();
+
+    int isDisabled = (drawItem->itemState & ODS_DISABLED) != 0;
+    int isPressed = (drawItem->itemState & ODS_SELECTED) != 0;
+    int isHot = (drawItem->itemState & ODS_HOTLIGHT) != 0;
+    int hasFocus = (drawItem->itemState & ODS_FOCUS) != 0;
+
+    COLORREF background = g_settingsColors.buttonBackground;
+    if (isPressed) {
+        background = g_settingsColors.buttonPressed;
+    } else if (isHot) {
+        background = g_settingsColors.buttonHot;
+    }
+
+    HBRUSH backgroundBrush = CreateSolidBrush(background);
+    FillRect(drawItem->hDC, &drawItem->rcItem, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    HBRUSH borderBrush = CreateSolidBrush(hasFocus ? g_settingsColors.focus : g_settingsColors.border);
+    FrameRect(drawItem->hDC, &drawItem->rcItem, borderBrush);
+    DeleteObject(borderBrush);
+
+    char text[128];
+    GetWindowTextA(drawItem->hwndItem, text, sizeof(text));
+
+    RECT textRect = drawItem->rcItem;
+    if (isPressed) {
+        OffsetRect(&textRect, 1, 1);
+    }
+
+    SetBkMode(drawItem->hDC, TRANSPARENT);
+    SetTextColor(drawItem->hDC, isDisabled ? g_settingsColors.disabledText : g_settingsColors.text);
+    DrawTextA(drawItem->hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 void EnsureCursorVisible(const char* reason) {
@@ -650,6 +825,8 @@ void LoadConfig() {
                     g_app.config.perMonitorInputDetection = atoi(value);
                 } else if (strcmp(key, "pixelShiftCompensation") == 0) {
                     g_app.config.pixelShiftCompensation = atoi(value);
+                } else if (strcmp(key, "uiTheme") == 0) {
+                    g_app.config.uiTheme = atoi(value);
                 } else if (strncmp(key, "monitorEnabled_", 15) == 0) {
                     const char* identifier = key + 15;
                     hadMonitorConfig = 1;
@@ -721,6 +898,7 @@ void SaveConfig() {
         fprintf(f, "debugMode=%d\n", g_app.config.debugMode);
         fprintf(f, "perMonitorInputDetection=%d\n", g_app.config.perMonitorInputDetection);
         fprintf(f, "pixelShiftCompensation=%d\n", g_app.config.pixelShiftCompensation);
+        fprintf(f, "uiTheme=%d\n", g_app.config.uiTheme);
         // Save monitor settings using persistent device path as key, with comment showing friendly name
         for (int i = 0; i < g_monitorCount; i++) {
             fprintf(f, "monitorEnabled_%s=%d ; %s\n",
@@ -1668,6 +1846,52 @@ void OpenConfigFileLocation() {
 
 LRESULT CALLBACK SettingsDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_ERASEBKGND:
+            if (IsDarkSettingsTheme()) {
+                UpdateSettingsThemeResources();
+                RECT rect;
+                GetClientRect(hWnd, &rect);
+                FillRect((HDC)wParam, &rect, g_hSettingsBackgroundBrush);
+                return 1;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN:
+            if (IsDarkSettingsTheme()) {
+                UpdateSettingsThemeResources();
+                HDC hdc = (HDC)wParam;
+                HWND hControl = (HWND)lParam;
+                int controlId = hControl ? GetDlgCtrlID(hControl) : 0;
+                int useControlBackground = controlId == IDC_THEME_COMBO;
+                SetTextColor(hdc, g_settingsColors.text);
+                SetBkColor(hdc, useControlBackground ? g_settingsColors.controlBackground : g_settingsColors.background);
+                SetBkMode(hdc, useControlBackground ? OPAQUE : TRANSPARENT);
+                return (LRESULT)(useControlBackground ? g_hSettingsControlBrush : g_hSettingsBackgroundBrush);
+            }
+            break;
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+            if (IsDarkSettingsTheme()) {
+                UpdateSettingsThemeResources();
+                HDC hdc = (HDC)wParam;
+                SetTextColor(hdc, g_settingsColors.text);
+                SetBkColor(hdc, g_settingsColors.controlBackground);
+                SetBkMode(hdc, OPAQUE);
+                return (LRESULT)g_hSettingsControlBrush;
+            }
+            break;
+        case WM_DRAWITEM:
+        {
+            DRAWITEMSTRUCT* drawItem = (DRAWITEMSTRUCT*)lParam;
+            if (drawItem &&
+                (drawItem->CtlID == IDC_APPLY_BTN ||
+                 drawItem->CtlID == IDC_CONFIG_BTN ||
+                 drawItem->CtlID == IDC_CLOSE_BTN)) {
+                DrawSettingsButton(drawItem);
+                return TRUE;
+            }
+            break;
+        }
         case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
@@ -1829,6 +2053,18 @@ void ShowSettingsDialog() {
         SendMessage(hPixelShiftUpDown, UDM_SETRANGE, 0, MAKELPARAM(MAX_PIXEL_SHIFT_COMPENSATION, MIN_PIXEL_SHIFT_COMPENSATION));
         y += rowHeight + ScaleDPI(5);
 
+        HWND hThemeLabel = CreateWindowA("STATIC", "Settings Theme:",
+                     WS_CHILD | WS_VISIBLE,
+                     margin, y, labelWidth, controlHeight, g_hSettingsDialog, NULL, hMod, NULL);
+        HWND hThemeCombo = CreateWindowA("COMBOBOX", "",
+                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                     margin + labelWidth, y, ScaleDPI(130), ScaleDPI(110),
+                     g_hSettingsDialog, (HMENU)IDC_THEME_COMBO, hMod, NULL);
+        SendMessageA(hThemeCombo, CB_ADDSTRING, 0, (LPARAM)"Light");
+        SendMessageA(hThemeCombo, CB_ADDSTRING, 0, (LPARAM)"Dark");
+        SendMessageA(hThemeCombo, CB_ADDSTRING, 0, (LPARAM)"OLED");
+        y += rowHeight + ScaleDPI(5);
+
         HWND hVideoCheck = CreateWindowA("BUTTON", "Prevent Screen Saver During Media Playback",
                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                      margin, y, checkboxWidth, controlHeight, g_hSettingsDialog, (HMENU)IDC_MEDIA_CHECK, hMod, NULL);
@@ -1872,17 +2108,17 @@ void ShowSettingsDialog() {
         y += margin;
         int btnX = margin;
         HWND hApplyBtn = CreateWindowA("BUTTON", "Apply",
-                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                      btnX, y, buttonWidth, buttonHeight, g_hSettingsDialog, (HMENU)IDC_APPLY_BTN, hMod, NULL);
         btnX += buttonWidth + buttonSpacing;
 
         HWND hConfigBtn = CreateWindowA("BUTTON", "Open Config File",
-                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                      btnX, y, configBtnWidth, buttonHeight, g_hSettingsDialog, (HMENU)IDC_CONFIG_BTN, hMod, NULL);
         btnX += configBtnWidth + buttonSpacing;
 
         HWND hCloseBtn = CreateWindowA("BUTTON", "Close",
-                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                      btnX, y, buttonWidth, buttonHeight, g_hSettingsDialog, (HMENU)IDC_CLOSE_BTN, hMod, NULL);
 
         // Calculate dialog size based on content
@@ -1914,6 +2150,8 @@ void ShowSettingsDialog() {
             SendMessageA(hPixelShiftLabel, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPixelShiftEdit, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPixelShiftUpDown, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
+            SendMessageA(hThemeLabel, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
+            SendMessageA(hThemeCombo, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hMonitorsLabel, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hApplyBtn, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hConfigBtn, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
@@ -1938,6 +2176,8 @@ void ShowSettingsDialog() {
         AddTooltip(g_hSettingsDialog, hPixelShiftEdit,
                    "Expand the screen saver window beyond the monitor bounds by this many pixels on each side. "
                    "Use 4-8 on QD-OLED panels (e.g. Alienware) to prevent hardware pixel shift from exposing the desktop edge. (0 = disabled)");
+        AddTooltip(g_hSettingsDialog, hThemeCombo,
+                   "Choose the settings window theme. OLED uses pure black surfaces.");
 
         // Set initial values
         char buffer[32];
@@ -1956,10 +2196,13 @@ void ShowSettingsDialog() {
         sprintf_s(buffer, 32, "%d", g_app.config.pixelShiftCompensation);
         SetDlgItemTextA(g_hSettingsDialog, IDC_PIXELSHIFT_EDIT, buffer);
 
+        SendMessageA(hThemeCombo, CB_SETCURSEL, (WPARAM)g_app.config.uiTheme, 0);
+
         for (int i = 0; i < g_monitorCount; i++) {
             CheckDlgButton(g_hSettingsDialog, IDC_MONITOR_BASE + i, g_app.config.monitorsEnabled[i] ? BST_CHECKED : BST_UNCHECKED);
         }
 
+        RefreshSettingsDialogTheme(g_hSettingsDialog);
         ShowWindow(g_hSettingsDialog, SW_SHOW);
         UpdateWindow(g_hSettingsDialog);
     }
@@ -1980,12 +2223,17 @@ void ApplySettings(HWND hWnd) {
     int oldDebug = g_app.config.debugMode;
     int oldStartup = g_app.config.startupEnabled;
     int oldPerMonitor = g_app.config.perMonitorInputDetection;
+    int oldUiTheme = g_app.config.uiTheme;
 
     g_app.config.mediaDetectionEnabled = IsDlgButtonChecked(hWnd, IDC_MEDIA_CHECK) == BST_CHECKED;
     g_app.config.allowScreenSaverDuringTwitchMedia = IsDlgButtonChecked(hWnd, IDC_TWITCH_MEDIA_CHECK) == BST_CHECKED;
     g_app.config.debugMode = IsDlgButtonChecked(hWnd, IDC_DEBUG_CHECK) == BST_CHECKED;
     g_app.config.startupEnabled = IsDlgButtonChecked(hWnd, IDC_STARTUP_CHECK) == BST_CHECKED;
     g_app.config.perMonitorInputDetection = IsDlgButtonChecked(hWnd, IDC_PERMONITOR_CHECK) == BST_CHECKED;
+    LRESULT selectedTheme = SendDlgItemMessageA(hWnd, IDC_THEME_COMBO, CB_GETCURSEL, 0, 0);
+    if (selectedTheme != CB_ERR) {
+        g_app.config.uiTheme = (int)selectedTheme;
+    }
 
     GetDlgItemTextA(hWnd, IDC_PIXELSHIFT_EDIT, buffer, 32);
     g_app.config.pixelShiftCompensation = atoi(buffer);
@@ -2024,7 +2272,7 @@ void ApplySettings(HWND hWnd) {
     SaveConfig();
     UpdateStartupRegistry();
 
-    LogMessage("Settings applied: timeout %ds->%ds, interval %dms->%dms, media %d->%d, twitchMediaBypass %d->%d, debug %d->%d, startup %d->%d, perMonitor %d->%d, pixelShift %dpx",
+    LogMessage("Settings applied: timeout %ds->%ds, interval %dms->%dms, media %d->%d, twitchMediaBypass %d->%d, debug %d->%d, startup %d->%d, perMonitor %d->%d, pixelShift %dpx, uiTheme %s->%s",
              oldTimeout, g_app.config.idleTimeout,
              oldInterval, g_app.config.checkInterval,
              oldMedia, g_app.config.mediaDetectionEnabled,
@@ -2032,7 +2280,12 @@ void ApplySettings(HWND hWnd) {
              oldDebug, g_app.config.debugMode,
              oldStartup, g_app.config.startupEnabled,
              oldPerMonitor, g_app.config.perMonitorInputDetection,
-             g_app.config.pixelShiftCompensation);
+             g_app.config.pixelShiftCompensation,
+             GetUiThemeName(oldUiTheme), GetUiThemeName(g_app.config.uiTheme));
+
+    if (oldUiTheme != g_app.config.uiTheme) {
+        RefreshSettingsDialogTheme(hWnd);
+    }
 
     if (oldInterval != g_app.config.checkInterval) {
         KillTimer(g_app.hWnd, TIMER_IDLE_CHECK);
@@ -2048,6 +2301,8 @@ void ApplySettings(HWND hWnd) {
 
     sprintf_s(buffer, 32, "%d", g_app.config.pixelShiftCompensation);
     SetDlgItemTextA(hWnd, IDC_PIXELSHIFT_EDIT, buffer);
+
+    SendDlgItemMessageA(hWnd, IDC_THEME_COMBO, CB_SETCURSEL, (WPARAM)g_app.config.uiTheme, 0);
 }
 
 void UpdateTrayIcon(int active) {
@@ -2101,6 +2356,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_app.config.startupEnabled = 0;
             g_app.config.debugMode = 0;
             g_app.config.perMonitorInputDetection = 0;
+            g_app.config.pixelShiftCompensation = 0;
+            g_app.config.uiTheme = UI_THEME_LIGHT;
             for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
                 g_app.config.monitorsEnabled[i] = 1;
             }
@@ -2439,6 +2696,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 DeleteObject(g_blackBrush);
                 g_blackBrush = NULL;
             }
+
+            DeleteSettingsThemeBrushes();
 
             // Note: Icons loaded via LoadIcon from resources don't need DestroyIcon
             g_hIconActive = NULL;
